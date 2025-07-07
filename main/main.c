@@ -27,7 +27,7 @@
 #define EXAMPLE_LCD_COLOR_SPACE     (ESP_LCD_COLOR_SPACE_BGR)
 #define EXAMPLE_LCD_BITS_PER_PIXEL  (16)
 #define EXAMPLE_LCD_DRAW_BUFF_DOUBLE (1)
-#define EXAMPLE_LCD_DRAW_BUFF_HEIGHT (160)  // 全刷缓冲区必须比分辨率高，局部刷新可以小于分辨率
+#define EXAMPLE_LCD_DRAW_BUFF_HEIGHT (EXAMPLE_LCD_V_RES)  // 全刷缓冲区必须比分辨率高，局部刷新可以小于分辨率
 // #define EXAMPLE_LCD_BL_ON_LEVEL     (1)
 
 /* LCD pins */
@@ -40,9 +40,9 @@
 // #define EXAMPLE_LCD_GPIO_BL         (GPIO_NUM_NC)
 
 typedef enum {
-    LCD_SCREEN_0 = 0,
-    LCD_SCREEN_1,
-    LCD_SCREEN_NUM, // 屏幕数量
+    LCD_SCREEN_0 = 0,   // 左眼屏幕
+    LCD_SCREEN_1,       // 右眼屏幕
+    LCD_SCREEN_NUM,     // 屏幕数量
 }lcd_screen_num_t;
 
 typedef struct {
@@ -53,12 +53,17 @@ typedef struct {
     /* CS脚这些是不同的 */
     int cs_gpio_num;                // 片选GPIO编号
     const char *name;               // 屏幕名称
-    lcd_screen_num_t num;                   // 屏幕编号
+    lcd_screen_num_t num;           // 屏幕编号
+    /* 屏幕方向相关 */
+    bool mirror_x;                  // X方向镜像
+    bool mirror_y;                  // Y方向镜像
+    bool swap_xy;                   // 交换XY
 } lcd_screen_t;
 
+// 配置每块屏幕的方向
 static lcd_screen_t lcd_screens[LCD_SCREEN_NUM] = {
-    { .cs_gpio_num = EXAMPLE_LCD_GPIO_CS0, .name = "LEFT EYE" , .num = LCD_SCREEN_0 },
-    { .cs_gpio_num = EXAMPLE_LCD_GPIO_CS1, .name = "RIGHT EYE" , .num = LCD_SCREEN_1 },
+    { .cs_gpio_num = EXAMPLE_LCD_GPIO_CS0, .name = "LEFT EYE",  .num = LCD_SCREEN_0, .mirror_x = false, .mirror_y = false, .swap_xy = false},
+    { .cs_gpio_num = EXAMPLE_LCD_GPIO_CS1, .name = "RIGHT EYE", .num = LCD_SCREEN_1, .mirror_x = false, .mirror_y = false, .swap_xy = false},
 };
 
 static const char *TAG = "EXAMPLE";
@@ -104,14 +109,6 @@ static esp_err_t lcd_screen_init(lcd_screen_t *screen)
     ESP_GOTO_ON_ERROR(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)EXAMPLE_LCD_SPI_NUM, &io_config, &screen->io), err, screen->name, "New panel IO failed");
 
     ESP_LOGI(TAG, "Install LCD driver");
-    printf(" _______      ______       ______       ______       ______       ____        \r\n");
-    printf("/______/\\    /_____/\\     /_____/\\     /_____/\\     /_____/\\     /___/\\       \r\n");
-    printf("\\::::__\\/__  \\:::__\\/     \\:::_:\\ \\    \\:::_ \\ \\    \\:::_ \\ \\    \\_::\\ \\      \r\n");
-    printf(" \\:\\ /____/\\  \\:\\ \\  __    \\:\\_\\:\\ \\    \\:\\ \\ \\ \\    \\:\\ \\ \\ \\     \\::\\ \\     \r\n");
-    printf("  \\:\\\\_  _\\/   \\:\\ \\/_/\\    \\::__:\\ \\    \\:\\ \\ \\ \\    \\:\\ \\ \\ \\    _\\: \\ \\__  \r\n");
-    printf("   \\:\\_\\ \\ \\    \\:\\_\\ \\ \\        \\ \\ \\    \\:\\/.:| |    \\:\\_\\ \\ \\  /__\\: \\__/\\ \r\n");
-    printf("    \\_____\\/     \\_____\\/         \\_\\/     \\____/_/     \\_____\\/  \\________\\/ \r\n");
-    printf("                                                                              \r\n");
     const esp_lcd_panel_dev_config_t panel_config = {
         .reset_gpio_num = EXAMPLE_LCD_GPIO_RST,
         .color_space = EXAMPLE_LCD_COLOR_SPACE,
@@ -122,9 +119,10 @@ static esp_err_t lcd_screen_init(lcd_screen_t *screen)
     esp_lcd_panel_reset(screen->panel);
     esp_lcd_panel_init(screen->panel);
     esp_lcd_panel_invert_color(screen->panel, false);
-    esp_lcd_panel_mirror(screen->panel, true, true);
+    esp_lcd_panel_mirror(screen->panel, screen->mirror_x, screen->mirror_y);
+    esp_lcd_panel_swap_xy(screen->panel, screen->swap_xy);
     esp_lcd_panel_disp_on_off(screen->panel, false);
-    if (screen->num == LCD_SCREEN_NUM - 1) {    // 最后一个屏幕初始化后再全部开启
+    if (screen->num == LCD_SCREEN_NUM - 1) {    // 最后一个屏幕初始化结束后再全部开启，避免屏幕反复闪烁多次
         esp_lcd_panel_disp_on_off(screen->panel, true);
         /* LCD backlight on */
         // ESP_ERROR_CHECK(gpio_set_level(EXAMPLE_LCD_GPIO_BL, EXAMPLE_LCD_BL_ON_LEVEL));
@@ -152,9 +150,9 @@ static esp_err_t lcd_screen_lvgl_register(lcd_screen_t *screen)
         .color_format = LV_COLOR_FORMAT_RGB565,
 #endif
         .rotation = {
-            .swap_xy = false,
-            .mirror_x = false,
-            .mirror_y = false,
+            .swap_xy = screen->swap_xy,
+            .mirror_x = screen->mirror_x,
+            .mirror_y = screen->mirror_y,
         },
         .flags = {
             .buff_dma = true,
@@ -171,6 +169,15 @@ static esp_err_t lcd_screen_lvgl_register(lcd_screen_t *screen)
 
 void app_main(void)
 {
+    printf(" _______      ______       ______       ______       ______       ____        \r\n");
+    printf("/______/\\    /_____/\\     /_____/\\     /_____/\\     /_____/\\     /___/\\       \r\n");
+    printf("\\::::__\\/__  \\:::__\\/     \\:::_:\\ \\    \\:::_ \\ \\    \\:::_ \\ \\    \\_::\\ \\      \r\n");
+    printf(" \\:\\ /____/\\  \\:\\ \\  __    \\:\\_\\:\\ \\    \\:\\ \\ \\ \\    \\:\\ \\ \\ \\     \\::\\ \\     \r\n");
+    printf("  \\:\\\\_  _\\/   \\:\\ \\/_/\\    \\::__:\\ \\    \\:\\ \\ \\ \\    \\:\\ \\ \\ \\    _\\: \\ \\__  \r\n");
+    printf("   \\:\\_\\ \\ \\    \\:\\_\\ \\ \\        \\ \\ \\    \\:\\/.:| |    \\:\\_\\ \\ \\  /__\\: \\__/\\ \r\n");
+    printf("    \\_____\\/     \\_____\\/         \\_\\/     \\____/_/     \\_____\\/  \\________\\/ \r\n");
+    printf("                                                                              \r\n");
+
     /* LVGL初始化（只需一次） */
     const lvgl_port_cfg_t lvgl_cfg = {
         .task_priority = 4,
@@ -193,14 +200,23 @@ void app_main(void)
     /* 分别显示不同内容 */
     for (int i = 0; i < LCD_SCREEN_NUM; ++i) {
         lvgl_port_lock(0);
-        lv_disp_t *disp = lcd_screens[i].disp;
-        lv_disp_set_default(disp); // 切换当前LVGL默认屏幕
+        /* 关键修改：设置当前操作的显示设备 */
+        lv_disp_set_default(lcd_screens[i].disp);
+
+        /* 为当前显示设备创建独立的屏幕对象 */
+        lv_obj_t *scr = lv_obj_create(NULL);
+        lv_disp_load_scr(scr);
+
         if (i == 0) {
-            lv_example_gif_1(); // 屏幕0显示GIF
-        } else {
-            lv_obj_t *label = lv_label_create(lv_scr_act());
-            lv_label_set_text(label, "Hello LCD1!");
+            lv_obj_t *label = lv_label_create(scr);
+            lv_label_set_text(label, "Hello LEFT Eye!");
             lv_obj_center(label);
+        } else {
+            lv_obj_t *label = lv_label_create(scr);
+            lv_label_set_text(label, "Hello RIGHT Eye!");
+            lv_obj_center(label);
+            // 若需要显示GIF，使用以下代码替换：
+            // lv_example_gif_1(); // 确保该函数使用当前默认显示设备
         }
         lvgl_port_unlock();
     }
