@@ -1,4 +1,4 @@
 .vscode/
-.build/
-.managed_components/
+build/
+managed_components/
 dependencies.lock
