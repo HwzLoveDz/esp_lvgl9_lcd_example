@@ -16,3 +16,4 @@ dependencies:
   #   public: true
   hwzlovedz/esp_lcd_gc9d01: ^0.0.3
   espressif/esp_lvgl_port: ^2.6.0
+  lvgl/lvgl: ^8.4.0

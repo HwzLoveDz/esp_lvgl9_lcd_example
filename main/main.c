@@ -5,15 +5,15 @@
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_check.h"
-#include "driver/i2c.h"
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_vendor.h"
 #include "esp_lcd_panel_ops.h"
-#include "esp_lvgl_port.h"
 #include "esp_lcd_gc9d01.h"
-#include "lv_examples.h"
+#include "lvgl.h"
+#include "esp_timer.h"
+#include "img_bulb_gif.h"
 
 /* LCD size */
 #define EXAMPLE_LCD_H_RES   (160)
@@ -26,48 +26,40 @@
 #define EXAMPLE_LCD_PARAM_BITS      (8)
 #define EXAMPLE_LCD_COLOR_SPACE     (ESP_LCD_COLOR_SPACE_BGR)
 #define EXAMPLE_LCD_BITS_PER_PIXEL  (16)
-#define EXAMPLE_LCD_DRAW_BUFF_DOUBLE (1)
-#define EXAMPLE_LCD_DRAW_BUFF_HEIGHT (EXAMPLE_LCD_V_RES)  // 全刷缓冲区必须比分辨率高，局部刷新可以小于分辨率
-// #define EXAMPLE_LCD_BL_ON_LEVEL     (1)
+#define EXAMPLE_LCD_DRAW_BUFF_HEIGHT (160) // 局部刷新缓冲区高度
 
 /* LCD pins */
 #define EXAMPLE_LCD_GPIO_SCLK       (GPIO_NUM_39)
 #define EXAMPLE_LCD_GPIO_MOSI       (GPIO_NUM_38)
 #define EXAMPLE_LCD_GPIO_RST        (GPIO_NUM_45)
 #define EXAMPLE_LCD_GPIO_DC         (GPIO_NUM_40)
-#define EXAMPLE_LCD_GPIO_CS0         (GPIO_NUM_47)
-#define EXAMPLE_LCD_GPIO_CS1         (GPIO_NUM_48)
-// #define EXAMPLE_LCD_GPIO_BL         (GPIO_NUM_NC)
+#define EXAMPLE_LCD_GPIO_CS0        (GPIO_NUM_47)
+#define EXAMPLE_LCD_GPIO_CS1        (GPIO_NUM_48)
 
-typedef enum {
-    LCD_SCREEN_0 = 0,   // 左眼屏幕
-    LCD_SCREEN_1,       // 右眼屏幕
-    LCD_SCREEN_NUM,     // 屏幕数量
-}lcd_screen_num_t;
-
-typedef struct {
-    /* 初始化等都是相同的 */
-    esp_lcd_panel_io_handle_t io;   // LCD面板IO句柄
-    esp_lcd_panel_handle_t panel;   // LCD面板句柄
-    lv_display_t *disp;             // LVGL显示句柄
-    /* CS脚这些是不同的 */
-    int cs_gpio_num;                // 片选GPIO编号
-    const char *name;               // 屏幕名称
-    lcd_screen_num_t num;           // 屏幕编号
-    /* 屏幕方向相关 */
-    bool mirror_x;                  // X方向镜像
-    bool mirror_y;                  // Y方向镜像
-    bool swap_xy;                   // 交换XY
-} lcd_screen_t;
-
-// 配置每块屏幕的方向
-static lcd_screen_t lcd_screens[LCD_SCREEN_NUM] = {
-    { .cs_gpio_num = EXAMPLE_LCD_GPIO_CS0, .name = "LEFT EYE",  .num = LCD_SCREEN_0, .mirror_x = false, .mirror_y = false, .swap_xy = false},
-    { .cs_gpio_num = EXAMPLE_LCD_GPIO_CS1, .name = "RIGHT EYE", .num = LCD_SCREEN_1, .mirror_x = false, .mirror_y = false, .swap_xy = false},
-};
+#define LCD_SCREEN_NUM 2
 
 static const char *TAG = "EXAMPLE";
 
+// 屏幕描述结构体
+typedef struct {
+    int cs_gpio_num;
+    const char *name;
+    esp_lcd_panel_io_handle_t io;
+    esp_lcd_panel_handle_t panel;
+    lv_disp_drv_t *disp_drv; // 新增
+} lcd_screen_t;
+
+static lcd_screen_t lcd_screens[LCD_SCREEN_NUM] = {
+    { .cs_gpio_num = EXAMPLE_LCD_GPIO_CS0, .name = "LEFT EYE" },
+    { .cs_gpio_num = EXAMPLE_LCD_GPIO_CS1, .name = "RIGHT EYE" },
+};
+
+// LVGL缓冲区
+// static lv_color_t buf1[LCD_SCREEN_NUM][EXAMPLE_LCD_H_RES * EXAMPLE_LCD_DRAW_BUFF_HEIGHT];
+// static lv_color_t buf2[LCD_SCREEN_NUM][EXAMPLE_LCD_H_RES * EXAMPLE_LCD_DRAW_BUFF_HEIGHT];
+static lv_disp_t *disp[LCD_SCREEN_NUM] = {NULL};
+
+// SPI初始化
 static esp_err_t InitializeSpi()
 {
     esp_err_t ret = ESP_OK;
@@ -84,18 +76,17 @@ static esp_err_t InitializeSpi()
     return ret;
 }
 
+static bool lv_port_flush_ready(esp_lcd_panel_io_handle_t io, esp_lcd_panel_io_event_data_t *edata, void *user_ctx)
+{
+    lv_disp_drv_t *disp_drv = (lv_disp_drv_t *)user_ctx;
+    lv_disp_flush_ready(disp_drv);
+    return false;
+}
+
+// 屏幕底层初始化
 static esp_err_t lcd_screen_init(lcd_screen_t *screen)
 {
     esp_err_t ret = ESP_OK;
-
-    /* LCD backlight */
-    // gpio_config_t bk_gpio_config = {
-    //     .mode = GPIO_MODE_OUTPUT,
-    //     .pin_bit_mask = 1ULL << EXAMPLE_LCD_GPIO_BL
-    // };
-    // ESP_ERROR_CHECK(gpio_config(&bk_gpio_config));
-
-    /* LCD initialization */
     ESP_LOGI(screen->name, "Install panel IO");
     const esp_lcd_panel_io_spi_config_t io_config = {
         .dc_gpio_num = EXAMPLE_LCD_GPIO_DC,
@@ -105,10 +96,12 @@ static esp_err_t lcd_screen_init(lcd_screen_t *screen)
         .lcd_param_bits = EXAMPLE_LCD_PARAM_BITS,
         .spi_mode = 0,
         .trans_queue_depth = 10,
+        .on_color_trans_done = lv_port_flush_ready,
+        .user_ctx = screen->disp_drv, // 关键
     };
     ESP_GOTO_ON_ERROR(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)EXAMPLE_LCD_SPI_NUM, &io_config, &screen->io), err, screen->name, "New panel IO failed");
 
-    ESP_LOGI(TAG, "Install LCD driver");
+    ESP_LOGI(screen->name, "Install LCD driver");
     const esp_lcd_panel_dev_config_t panel_config = {
         .reset_gpio_num = EXAMPLE_LCD_GPIO_RST,
         .color_space = EXAMPLE_LCD_COLOR_SPACE,
@@ -119,105 +112,162 @@ static esp_err_t lcd_screen_init(lcd_screen_t *screen)
     esp_lcd_panel_reset(screen->panel);
     esp_lcd_panel_init(screen->panel);
     esp_lcd_panel_invert_color(screen->panel, false);
-    esp_lcd_panel_mirror(screen->panel, screen->mirror_x, screen->mirror_y);
-    esp_lcd_panel_swap_xy(screen->panel, screen->swap_xy);
-    esp_lcd_panel_disp_on_off(screen->panel, false);
-    if (screen->num == LCD_SCREEN_NUM - 1) {    // 最后一个屏幕初始化结束后再全部开启，避免屏幕反复闪烁多次
-        esp_lcd_panel_disp_on_off(screen->panel, true);
-        /* LCD backlight on */
-        // ESP_ERROR_CHECK(gpio_set_level(EXAMPLE_LCD_GPIO_BL, EXAMPLE_LCD_BL_ON_LEVEL));
-    }
-
+    esp_lcd_panel_mirror(screen->panel, false, false);
+    esp_lcd_panel_swap_xy(screen->panel, false);
+    esp_lcd_panel_disp_on_off(screen->panel, true);
     return ret;
-
 err:
     if (screen->panel) esp_lcd_panel_del(screen->panel);
     if (screen->io) esp_lcd_panel_io_del(screen->io);
     return ret;
 }
 
-static esp_err_t lcd_screen_lvgl_register(lcd_screen_t *screen)
+// LVGL flush_cb，每个屏幕一个
+static void my_flush_cb_0(lv_disp_drv_t * disp_drv, const lv_area_t *area, lv_color_t *px_map)
 {
-    const lvgl_port_display_cfg_t disp_cfg = {
-        .io_handle = screen->io,
-        .panel_handle = screen->panel,
-        .buffer_size = EXAMPLE_LCD_H_RES * EXAMPLE_LCD_DRAW_BUFF_HEIGHT,
-        .double_buffer = EXAMPLE_LCD_DRAW_BUFF_DOUBLE,
-        .hres = EXAMPLE_LCD_H_RES,
-        .vres = EXAMPLE_LCD_V_RES,
-        .monochrome = false,
-#if LVGL_VERSION_MAJOR >= 9
-        .color_format = LV_COLOR_FORMAT_RGB565,
-#endif
-        .rotation = {
-            .swap_xy = screen->swap_xy,
-            .mirror_x = screen->mirror_x,
-            .mirror_y = screen->mirror_y,
-        },
-        .flags = {
-            .buff_dma = true,
-            .buff_spiram = true,
-#if LVGL_VERSION_MAJOR >= 9
-            .swap_bytes = true,
-#endif
-            .full_refresh = true,
-        }
+    lcd_screen_t *screen = &lcd_screens[0];
+    int offsetx1 = area->x1;
+    int offsetx2 = area->x2;
+    int offsety1 = area->y1;
+    int offsety2 = area->y2;
+    esp_lcd_panel_draw_bitmap(screen->panel, offsetx1, offsety1, offsetx2 + 1, offsety2 + 1, px_map);
+    lv_disp_flush_ready(disp_drv);
+}
+static void my_flush_cb_1(lv_disp_drv_t * disp_drv, const lv_area_t *area, lv_color_t *px_map)
+{
+    lcd_screen_t *screen = &lcd_screens[1];
+    int offsetx1 = area->x1;
+    int offsetx2 = area->x2;
+    int offsety1 = area->y1;
+    int offsety2 = area->y2;
+    esp_lcd_panel_draw_bitmap(screen->panel, offsetx1, offsety1, offsetx2 + 1, offsety2 + 1, px_map);
+    lv_disp_flush_ready(disp_drv);
+}
+
+void lv_tick_task(void* arg)
+{
+    (void) arg;
+    lv_tick_inc(1);
+}
+
+static esp_err_t lv_port_tick_init(void)
+{
+    // 启动LVGL tick定时器（esp_timer，精度高于FreeRTOS软件定时器）
+    const esp_timer_create_args_t periodic_timer_args = {
+        .callback = &lv_tick_task,
+        .name = "lvgl_tick"
     };
-    screen->disp = lvgl_port_add_disp(&disp_cfg);
-    return (screen->disp != NULL) ? ESP_OK : ESP_FAIL;
+    esp_timer_handle_t periodic_timer;
+    ESP_ERROR_CHECK(esp_timer_create(&periodic_timer_args, &periodic_timer));
+    ESP_ERROR_CHECK(esp_timer_start_periodic(periodic_timer, 1000)); // 1ms
+
+    return ESP_OK;
+}
+
+LV_IMG_DECLARE(img_bulb_gif0);
+LV_IMG_DECLARE(img_bulb_gif1);
+
+void create_demo_app(void)
+{
+
+    // 屏幕0（左眼）
+    lv_disp_set_default(disp[0]);
+    lv_obj_t *scr0 = lv_obj_create(NULL);
+    lv_scr_load(scr0);
+
+    lv_obj_t *gif_left = lv_gif_create(scr0);
+    lv_gif_set_src(gif_left, &img_bulb_gif1);
+    lv_obj_align(gif_left, LV_ALIGN_CENTER, 0, 0);
+
+    lv_obj_t *label_left = lv_label_create(scr0);
+    lv_label_set_text(label_left, "L");
+    lv_obj_align_to(label_left, gif_left, LV_ALIGN_OUT_BOTTOM_MID, 0, 10);
+
+    // 屏幕1（右眼）
+    lv_disp_set_default(disp[1]);
+    lv_obj_t *scr1 = lv_obj_create(NULL);
+    lv_scr_load(scr1);
+
+    lv_obj_t *gif_right = lv_gif_create(scr1);
+    lv_gif_set_src(gif_right, &img_bulb_gif0);
+    lv_obj_align(gif_right, LV_ALIGN_CENTER, 0, 0);
+
+    lv_obj_t *label_right = lv_label_create(scr1);
+    lv_label_set_text(label_right, "R");
+    lv_obj_align_to(label_right, gif_right, LV_ALIGN_OUT_BOTTOM_MID, 0, 10);
+
+    lv_disp_set_default(disp[0]);
+}
+
+/* Creates a semaphore to handle concurrent call to lvgl stuff
+ * If you wish to call *any* lvgl function from other threads/tasks
+ * you should lock on the very same semaphore! */
+SemaphoreHandle_t xGuiSemaphore;
+
+void uiTask(void *pvParameters)
+{
+    (void) pvParameters;
+    xGuiSemaphore = xSemaphoreCreateMutex();
+
+    lv_init();
+
+    ESP_ERROR_CHECK(InitializeSpi());
+
+    // 分配LVGL缓冲区
+    static lv_color_t* buf1[LCD_SCREEN_NUM];
+    static lv_color_t* buf2[LCD_SCREEN_NUM];
+    static lv_disp_draw_buf_t draw_buf[LCD_SCREEN_NUM];
+    static lv_disp_drv_t disp_drv[LCD_SCREEN_NUM];
+
+    for (int i = 0; i < LCD_SCREEN_NUM; ++i) {
+        buf1[i] = heap_caps_malloc(EXAMPLE_LCD_H_RES * EXAMPLE_LCD_DRAW_BUFF_HEIGHT * sizeof(lv_color_t), MALLOC_CAP_DMA);
+        assert(buf1[i]);
+#ifndef CONFIG_LV_TFT_DISPLAY_MONOCHROME
+        buf2[i] = heap_caps_malloc(EXAMPLE_LCD_H_RES * EXAMPLE_LCD_DRAW_BUFF_HEIGHT * sizeof(lv_color_t), MALLOC_CAP_DMA);
+        assert(buf2[i]);
+#else
+        buf2[i] = NULL;
+#endif
+        lv_disp_draw_buf_init(&draw_buf[i], buf1[i], buf2[i], EXAMPLE_LCD_H_RES * EXAMPLE_LCD_DRAW_BUFF_HEIGHT);
+
+        lv_disp_drv_init(&disp_drv[i]);
+        disp_drv[i].hor_res = EXAMPLE_LCD_H_RES;
+        disp_drv[i].ver_res = EXAMPLE_LCD_V_RES;
+        disp_drv[i].draw_buf = &draw_buf[i];
+        disp_drv[i].user_data = &lcd_screens[i];
+        disp_drv[i].flush_cb = (i == 0) ? my_flush_cb_0 : my_flush_cb_1;
+        disp[i] = lv_disp_drv_register(&disp_drv[i]);
+        lcd_screens[i].disp_drv = &disp_drv[i]; // 关键：赋值
+    }
+
+    // 初始化所有屏幕（此时 screen->disp_drv 已经有值）
+    for (int i = 0; i < LCD_SCREEN_NUM; ++i) {
+        ESP_ERROR_CHECK(lcd_screen_init(&lcd_screens[i]));
+    }
+
+    lv_port_tick_init();
+    create_demo_app();
+
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+        if (pdTRUE == xSemaphoreTake(xGuiSemaphore, portMAX_DELAY)) {
+            lv_task_handler();
+            xSemaphoreGive(xGuiSemaphore);
+        }
+    }
+
+    // 资源释放（理论上不会执行到）
+    for (int i = 0; i < LCD_SCREEN_NUM; ++i) {
+        free(buf1[i]);
+#ifndef CONFIG_LV_TFT_DISPLAY_MONOCHROME
+        free(buf2[i]);
+#endif
+    }
+    vTaskDelete(NULL);
 }
 
 void app_main(void)
 {
-    printf(" _______      ______       ______       ______       ______       ____        \r\n");
-    printf("/______/\\    /_____/\\     /_____/\\     /_____/\\     /_____/\\     /___/\\       \r\n");
-    printf("\\::::__\\/__  \\:::__\\/     \\:::_:\\ \\    \\:::_ \\ \\    \\:::_ \\ \\    \\_::\\ \\      \r\n");
-    printf(" \\:\\ /____/\\  \\:\\ \\  __    \\:\\_\\:\\ \\    \\:\\ \\ \\ \\    \\:\\ \\ \\ \\     \\::\\ \\     \r\n");
-    printf("  \\:\\\\_  _\\/   \\:\\ \\/_/\\    \\::__:\\ \\    \\:\\ \\ \\ \\    \\:\\ \\ \\ \\    _\\: \\ \\__  \r\n");
-    printf("   \\:\\_\\ \\ \\    \\:\\_\\ \\ \\        \\ \\ \\    \\:\\/.:| |    \\:\\_\\ \\ \\  /__\\: \\__/\\ \r\n");
-    printf("    \\_____\\/     \\_____\\/         \\_\\/     \\____/_/     \\_____\\/  \\________\\/ \r\n");
-    printf("                                                                              \r\n");
 
-    /* LVGL初始化（只需一次） */
-    const lvgl_port_cfg_t lvgl_cfg = {
-        .task_priority = 4,
-        .task_stack = 4096,
-        .task_affinity = -1,
-        .task_max_sleep_ms = 500,
-        .timer_period_ms = 5
-    };
-    ESP_ERROR_CHECK(lvgl_port_init(&lvgl_cfg));
-
-    /* 初始化SPI总线（只需一次） */
-    ESP_ERROR_CHECK(InitializeSpi());
-
-    /* 初始化所有屏幕并注册到LVGL */
-    for (int i = 0; i < LCD_SCREEN_NUM; ++i) {
-        ESP_ERROR_CHECK(lcd_screen_init(&lcd_screens[i]));
-        ESP_ERROR_CHECK(lcd_screen_lvgl_register(&lcd_screens[i]));
-    }
-
-    /* 分别显示不同内容 */
-    for (int i = 0; i < LCD_SCREEN_NUM; ++i) {
-        lvgl_port_lock(0);
-        /* 关键修改：设置当前操作的显示设备 */
-        lv_disp_set_default(lcd_screens[i].disp);
-
-        /* 为当前显示设备创建独立的屏幕对象 */
-        lv_obj_t *scr = lv_obj_create(NULL);
-        lv_disp_load_scr(scr);
-
-        if (i == 0) {
-            lv_obj_t *label = lv_label_create(scr);
-            lv_label_set_text(label, "Hello LEFT Eye!");
-            lv_obj_center(label);
-        } else {
-            lv_obj_t *label = lv_label_create(scr);
-            lv_label_set_text(label, "Hello RIGHT Eye!");
-            lv_obj_center(label);
-            // 若需要显示GIF，使用以下代码替换：
-            // lv_example_gif_1(); // 确保该函数使用当前默认显示设备
-        }
-        lvgl_port_unlock();
-    }
+    xTaskCreatePinnedToCore(uiTask, "lv_ui_Task", 1024 * 8, NULL, 5, NULL, 1);
 }
